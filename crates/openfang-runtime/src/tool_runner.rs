@@ -5897,33 +5897,36 @@ mod tests {
     /// `sweep_with_age_thresholds` honours separate ages for Running and
     /// Completed entries: a Running entry under its TTL stays; a Completed
     /// entry past its grace is removed.
+    ///
+    /// This test does not depend on real elapsed time or system uptime —
+    /// `Instant` arithmetic with large `Duration`s panics on Windows when the
+    /// VM uptime is shorter than the subtracted duration. Instead we use
+    /// `Duration::ZERO` to expire a state immediately and `Duration::MAX` to
+    /// keep it forever.
     #[tokio::test]
     async fn test_completed_entries_swept_after_grace() {
         with_global_lock_async(|| async {
-            // Completed entry whose `when` is far enough in the past to be
-            // expired by even a 1ms grace.
-            let stale_id = "completed-stale".to_string();
-            let long_ago = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(3600))
-                .expect("instant arithmetic");
+            // Both entries are inserted with `created_at = Instant::now()`; the
+            // sweep decision is driven entirely by the threshold arguments
+            // (no artificially-old Instants).
+            let completed_id = "completed-entry".to_string();
+            let now = std::time::Instant::now();
             ASYNC_TASKS.insert(
-                stale_id.clone(),
+                completed_id.clone(),
                 TaskEntry {
                     handle: tokio::spawn(futures::future::pending::<()>()),
-                    created_at: long_ago,
-                    state: TaskState::Completed(long_ago),
+                    created_at: now,
+                    state: TaskState::Completed(now),
                 },
             );
             A2A_TASK_PROGRESS.insert(
-                stale_id.clone(),
-                std::sync::Arc::new(tokio::sync::Mutex::new("stale".to_string())),
+                completed_id.clone(),
+                std::sync::Arc::new(tokio::sync::Mutex::new("completed".to_string())),
             );
 
-            // Fresh Running entry that must NOT be removed under the same call
-            // (running_ttl is huge here).
-            let live_id = "running-fresh".to_string();
+            let running_id = "running-entry".to_string();
             ASYNC_TASKS.insert(
-                live_id.clone(),
+                running_id.clone(),
                 TaskEntry {
                     handle: tokio::spawn(futures::future::pending::<()>()),
                     created_at: std::time::Instant::now(),
@@ -5931,32 +5934,68 @@ mod tests {
                 },
             );
             A2A_TASK_PROGRESS.insert(
-                live_id.clone(),
-                std::sync::Arc::new(tokio::sync::Mutex::new("live".to_string())),
+                running_id.clone(),
+                std::sync::Arc::new(tokio::sync::Mutex::new("running".to_string())),
             );
 
-            // running_ttl = MAX (keep Running), completed_grace = 1ms (expire
-            // anything completed more than 1ms ago).
-            sweep_with_age_thresholds(
-                std::time::Duration::MAX,
-                std::time::Duration::from_millis(1),
-            );
+            // Pass 1: running_ttl = MAX (keep Running), completed_grace = ZERO
+            // (expire every Completed entry immediately). Only the completed
+            // entry should be swept.
+            sweep_with_age_thresholds(std::time::Duration::MAX, std::time::Duration::ZERO);
 
             assert!(
-                !ASYNC_TASKS.contains_key(&stale_id),
-                "Stale completed entry must be swept"
+                !ASYNC_TASKS.contains_key(&completed_id),
+                "Completed entry must be swept when completed_grace = ZERO"
             );
             assert!(
-                !A2A_TASK_PROGRESS.contains_key(&stale_id),
-                "Stale completed entry's progress must be swept"
+                !A2A_TASK_PROGRESS.contains_key(&completed_id),
+                "Completed entry's progress must be swept"
             );
             assert!(
-                ASYNC_TASKS.contains_key(&live_id),
-                "Fresh running entry must NOT be swept"
+                ASYNC_TASKS.contains_key(&running_id),
+                "Running entry must NOT be swept when running_ttl = MAX"
             );
             assert!(
-                A2A_TASK_PROGRESS.contains_key(&live_id),
-                "Fresh running entry's progress must NOT be swept"
+                A2A_TASK_PROGRESS.contains_key(&running_id),
+                "Running entry's progress must NOT be swept"
+            );
+
+            // Pass 2 (asymmetric check): re-insert a fresh Completed entry,
+            // then call with running_ttl = ZERO and completed_grace = MAX.
+            // Now the Running entry from above must go, and the new Completed
+            // entry must stay.
+            let completed_id_2 = "completed-entry-2".to_string();
+            let now_2 = std::time::Instant::now();
+            ASYNC_TASKS.insert(
+                completed_id_2.clone(),
+                TaskEntry {
+                    handle: tokio::spawn(futures::future::pending::<()>()),
+                    created_at: now_2,
+                    state: TaskState::Completed(now_2),
+                },
+            );
+            A2A_TASK_PROGRESS.insert(
+                completed_id_2.clone(),
+                std::sync::Arc::new(tokio::sync::Mutex::new("completed-2".to_string())),
+            );
+
+            sweep_with_age_thresholds(std::time::Duration::ZERO, std::time::Duration::MAX);
+
+            assert!(
+                !ASYNC_TASKS.contains_key(&running_id),
+                "Running entry must be swept when running_ttl = ZERO"
+            );
+            assert!(
+                !A2A_TASK_PROGRESS.contains_key(&running_id),
+                "Running entry's progress must be swept"
+            );
+            assert!(
+                ASYNC_TASKS.contains_key(&completed_id_2),
+                "Completed entry must NOT be swept when completed_grace = MAX"
+            );
+            assert!(
+                A2A_TASK_PROGRESS.contains_key(&completed_id_2),
+                "Completed entry's progress must NOT be swept"
             );
 
             // Cleanup: abort the pending future so it doesn't outlive the
