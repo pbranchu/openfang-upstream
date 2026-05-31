@@ -730,6 +730,114 @@ impl A2aClient {
         })?
     }
 
+    /// Send a task using SSE streaming, writing each text chunk into `progress` as it arrives.
+    ///
+    /// Identical to [`send_task_streaming`](Self::send_task_streaming) but the
+    /// shared `progress` buffer is overwritten with a snapshot of the latest
+    /// agent text each time the remote emits an SSE event, so callers can read
+    /// live output via the `a2a_check_task` tool while the task is still
+    /// running.
+    ///
+    /// # No wall-clock deadline
+    /// Unlike [`send_task_streaming`](Self::send_task_streaming), this variant
+    /// is the **async background dispatch** path (`a2a_send_async` →
+    /// `tokio::spawn`). The whole point of that path is to free the agent loop
+    /// from the result so long-running remote work (multi-hour runs, queued
+    /// jobs, etc.) can proceed without blocking the caller. Applying the
+    /// 300 s `SYNC_STREAMING_DEADLINE` here would defeat that — it would kill
+    /// any task that exceeded the deadline regardless of whether the user is
+    /// still waiting. Local cancellation is handled by
+    /// `tool_a2a_cancel_task` aborting the spawned future; remote-side
+    /// completion is bounded by whatever timeouts the remote agent enforces.
+    ///
+    /// # Snapshot semantics for `progress`
+    /// Each `on_task` callback **replaces** (not appends to) the buffer with
+    /// the cumulative agent text observed so far. Remote agents that emit
+    /// SSE events as snapshots (each event contains all output to date)
+    /// rather than as incremental deltas would otherwise cause the buffer to
+    /// grow quadratically — every snapshot would be appended to the running
+    /// concatenation of every earlier snapshot. With assignment semantics
+    /// the buffer always reflects the latest snapshot, and the final-event
+    /// case (where the caller overwrites with the serialised completed
+    /// task) keeps the post-completion view authoritative.
+    pub async fn send_task_streaming_with_progress(
+        &self,
+        url: &str,
+        message: &str,
+        session_id: Option<&str>,
+        progress: std::sync::Arc<tokio::sync::Mutex<String>>,
+    ) -> Result<A2aTask, String> {
+        let streaming_client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("Failed to build streaming client: {e}"))?;
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tasks/sendSubscribe",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": message}]
+                },
+                "sessionId": session_id,
+            }
+        });
+
+        let response = streaming_client
+            .post(url)
+            .header("Accept", "text/event-stream")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("A2A send_task_streaming_with_progress failed: {e}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "A2A send_task_streaming_with_progress returned {}",
+                response.status()
+            ));
+        }
+
+        // Delegate to the shared SSE loop. The progress callback REPLACES the
+        // buffer with a snapshot of the latest agent text on every event —
+        // see the "Snapshot semantics" section in the doc comment for why
+        // appending is wrong (it grows O(n^2) when the remote sends cumulative
+        // snapshots instead of deltas). The loop itself (byte accumulation,
+        // UTF-8-safe line splitting, `process_sse_line`) is identical to
+        // `send_task_streaming`.
+        consume_sse_stream(response, |task| {
+            let progress = progress.clone();
+            // Collect all agent-role text from this snapshot and join it into
+            // a single string. Each on_task event already carries the full
+            // cumulative view of the task; we don't add a newline between
+            // calls because we OVERWRITE the buffer, not append.
+            let snapshot: String = task
+                .messages
+                .iter()
+                .filter(|m| m.role == "agent")
+                .flat_map(|m| m.parts.iter())
+                .filter_map(|p| {
+                    if let A2aPart::Text { text } = p {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join("\n");
+            async move {
+                if snapshot.is_empty() {
+                    return;
+                }
+                let mut p = progress.lock().await;
+                // Overwrite, never append — see doc comment "Snapshot semantics".
+                *p = snapshot;
+            }
+        })
+        .await
+    }
+
     /// Get the status of a task from an external A2A agent.
     pub async fn get_task(&self, url: &str, task_id: &str) -> Result<A2aTask, String> {
         let request = serde_json::json!({
