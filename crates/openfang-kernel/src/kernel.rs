@@ -615,6 +615,34 @@ fn gethostname() -> Option<String> {
     }
 }
 
+/// Returns `true` if the session contains at least one message that represents
+/// genuine user activity, as opposed to autonomous tick prompts or
+/// context-injection summaries.
+///
+/// A "real" message is:
+/// - role = `User`
+/// - **not** tagged `MessageSource::ContextInjection` (calendar/email/etc.)
+/// - whose text does not start with `[AUTONOMOUS TICK]` or `[SCHEDULED TICK]`
+///
+/// This is the thundering-herd guard for session dreaming: heartbeat-only
+/// sessions (every agent fires a dream on every idle window) used to drown
+/// the LLM in pointless extraction calls. Extracted to a free function so it
+/// can be unit-tested directly without spinning up a kernel.
+pub(crate) fn has_real_user_activity(messages: &[openfang_types::message::Message]) -> bool {
+    use openfang_types::message::{MessageSource, Role};
+
+    messages.iter().any(|msg| {
+        if msg.role != Role::User {
+            return false;
+        }
+        if msg.source == Some(MessageSource::ContextInjection) {
+            return false;
+        }
+        let text = msg.content.text_content();
+        !text.starts_with("[AUTONOMOUS TICK]") && !text.starts_with("[SCHEDULED TICK]")
+    })
+}
+
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
@@ -5195,8 +5223,9 @@ impl OpenFangKernel {
     /// - The agent must opt in to structured memory (`manifest.memory.is_structured()`).
     /// - The session must contain *real* user activity — pure autonomous-tick sessions
     ///   (where the only inputs are `[AUTONOMOUS TICK]` / `[SCHEDULED TICK]` prompts or
-    ///   `ContextInjection` messages) are skipped to avoid the thundering-herd problem
-    ///   that surfaced in production when every heartbeat fired a dream.
+    ///   `ContextInjection` messages) are skipped via [`has_real_user_activity`] to
+    ///   avoid the thundering-herd problem that surfaced in production when every
+    ///   heartbeat fired a dream.
     pub async fn trigger_session_dream(self: &Arc<Self>, agent_id: AgentId) {
         use openfang_memory::user_memory::MemoryTopic;
         use openfang_runtime::compactor::{extract_structured, CompactionConfig};
@@ -5231,18 +5260,7 @@ impl OpenFangKernel {
         // tick prompts or context injections. A pure-tick session (heartbeat fires,
         // agent responds NO_REPLY, nothing else) is not worth consolidating.
         // This is the activity-gating fix from production (commit aa4ec5c on branchu).
-        let has_real_activity = session.messages.iter().any(|msg| {
-            if msg.role != openfang_types::message::Role::User {
-                return false;
-            }
-            if msg.source == Some(openfang_types::message::MessageSource::ContextInjection) {
-                return false;
-            }
-            let text = msg.content.text_content();
-            !text.starts_with("[AUTONOMOUS TICK]") && !text.starts_with("[SCHEDULED TICK]")
-        });
-
-        if !has_real_activity {
+        if !has_real_user_activity(&session.messages) {
             debug!(
                 agent_id = %agent_id,
                 messages = session.messages.len(),
@@ -10344,5 +10362,122 @@ system_prompt = "You are a test agent."
         );
 
         kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------
+    // has_real_user_activity — the thundering-herd guard for dreaming.
+    // Pure-tick sessions must skip dream consolidation; sessions with any
+    // genuine user activity must proceed.
+    // -----------------------------------------------------------------
+
+    /// Scenario 1: real user activity → predicate true → dream would proceed.
+    #[test]
+    fn test_has_real_user_activity_with_user_message() {
+        let messages = vec![
+            openfang_types::message::Message::user("Hello, how are you?"),
+            openfang_types::message::Message::assistant("I'm doing well, thanks!"),
+        ];
+        assert!(
+            has_real_user_activity(&messages),
+            "session with a normal user message must count as real activity"
+        );
+    }
+
+    /// Scenario 2: pure tick-only session → predicate false → dream skipped.
+    #[test]
+    fn test_has_real_user_activity_only_autonomous_ticks() {
+        let messages = vec![
+            openfang_types::message::Message::user("[AUTONOMOUS TICK] heartbeat"),
+            openfang_types::message::Message::assistant("NO_REPLY"),
+            openfang_types::message::Message::user("[AUTONOMOUS TICK] heartbeat"),
+            openfang_types::message::Message::assistant("NO_REPLY"),
+        ];
+        assert!(
+            !has_real_user_activity(&messages),
+            "pure [AUTONOMOUS TICK] session must NOT count as real activity"
+        );
+    }
+
+    /// Pure scheduled-tick session is also skipped.
+    #[test]
+    fn test_has_real_user_activity_only_scheduled_ticks() {
+        let messages = vec![
+            openfang_types::message::Message::user("[SCHEDULED TICK] daily summary"),
+            openfang_types::message::Message::assistant("NO_REPLY"),
+        ];
+        assert!(
+            !has_real_user_activity(&messages),
+            "pure [SCHEDULED TICK] session must NOT count as real activity"
+        );
+    }
+
+    /// Scenario 3: mixed session (ticks + one real user message) → predicate true.
+    #[test]
+    fn test_has_real_user_activity_mixed_ticks_and_real() {
+        let messages = vec![
+            openfang_types::message::Message::user("[AUTONOMOUS TICK] heartbeat"),
+            openfang_types::message::Message::assistant("NO_REPLY"),
+            openfang_types::message::Message::user("Hey, can you check my email?"),
+            openfang_types::message::Message::assistant("Sure, looking now."),
+            openfang_types::message::Message::user("[AUTONOMOUS TICK] heartbeat"),
+        ];
+        assert!(
+            has_real_user_activity(&messages),
+            "mixed session with at least one real user message must count as real activity"
+        );
+    }
+
+    /// Scenario 4: pure context-injection session → predicate false.
+    #[test]
+    fn test_has_real_user_activity_only_context_injections() {
+        let messages = vec![
+            openfang_types::message::Message::context_injection(
+                "Calendar: meeting with Alice at 3pm",
+            ),
+            openfang_types::message::Message::assistant("Noted."),
+            openfang_types::message::Message::context_injection("Email: 3 unread from Bob"),
+        ];
+        assert!(
+            !has_real_user_activity(&messages),
+            "pure ContextInjection session must NOT count as real activity"
+        );
+    }
+
+    /// Empty message slice → predicate false (trivially no activity).
+    #[test]
+    fn test_has_real_user_activity_empty() {
+        let messages: Vec<openfang_types::message::Message> = vec![];
+        assert!(
+            !has_real_user_activity(&messages),
+            "empty session must NOT count as real activity"
+        );
+    }
+
+    /// Only assistant messages → predicate false (assistant doesn't count).
+    #[test]
+    fn test_has_real_user_activity_only_assistant_messages() {
+        let messages = vec![
+            openfang_types::message::Message::assistant("Hello!"),
+            openfang_types::message::Message::assistant("Anyone there?"),
+        ];
+        assert!(
+            !has_real_user_activity(&messages),
+            "assistant-only session must NOT count as real activity"
+        );
+    }
+
+    /// Mixed ticks + context injections (no real user) → still false.
+    #[test]
+    fn test_has_real_user_activity_ticks_plus_context_injections() {
+        let messages = vec![
+            openfang_types::message::Message::user("[AUTONOMOUS TICK] heartbeat"),
+            openfang_types::message::Message::context_injection("Calendar update"),
+            openfang_types::message::Message::user("[SCHEDULED TICK] morning"),
+            openfang_types::message::Message::assistant("NO_REPLY"),
+        ];
+        assert!(
+            !has_real_user_activity(&messages),
+            "ticks + context-injections (no real user) must NOT count as real activity"
+        );
     }
 }
