@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -45,6 +45,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 9 {
         migrate_v9(conn)?;
+    }
+
+    if current_version < 10 {
+        migrate_v10(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -366,6 +370,90 @@ fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 10: Structured-memory storage tables.
+///
+/// Adds three tables — `session_extractions`, `user_memory_topics`,
+/// `user_agent_memory_topics` — that back the opt-in structured memory
+/// system. None of these tables are populated by default agents: the
+/// producer (`extract_structured` / dreamer) is gated on
+/// `MemoryConfig::is_structured()` and lands in a later PR. The tables are
+/// created unconditionally so the storage and control-API surface is
+/// available the moment an agent opts in.
+///
+/// Schema choices:
+///
+/// - `session_extractions` carries denormalized `user_id` and `agent_id`
+///   columns from the start. The audit endpoint filters by owning user
+///   and surfaces a `session_deleted` flag derived from a LEFT JOIN
+///   against `sessions`; keeping the ids on the row means audit
+///   attribution survives a session delete instead of orphaning the row.
+/// - `user_memory_topics` ships with `expires_at` (optional ISO timestamp;
+///   expired rows are pruned at read time) and `embedding` (BLOB of packed
+///   little-endian f32 values for optional cosine-similarity retrieval).
+///   The producer populates `embedding` asynchronously, so the column
+///   stays nullable.
+/// - `user_agent_memory_topics` is the per-(user, agent) sibling of
+///   `user_memory_topics`. Topics here are scoped to "how this user
+///   interacts with this specific agent" and do not bleed across agents.
+///
+/// Indexes:
+/// - `idx_extractions_session` for the per-session loader.
+/// - `idx_extractions_user_created` for the audit endpoint's
+///   `(user_id, created_at)` ordering.
+/// - `idx_user_memory_user` for the per-user topic index.
+/// - `idx_user_agent_memory` for the per-(user, agent) topic index.
+fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS session_extractions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            user_id TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+            agent_id TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+            facts TEXT NOT NULL DEFAULT '[]',
+            preferences TEXT NOT NULL DEFAULT '[]',
+            decisions TEXT NOT NULL DEFAULT '[]',
+            tasks TEXT NOT NULL DEFAULT '[]',
+            open_items TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_extractions_session
+            ON session_extractions(session_id);
+        CREATE INDEX IF NOT EXISTS idx_extractions_user_created
+            ON session_extractions(user_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS user_memory_topics (
+            user_id TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            expires_at TEXT DEFAULT NULL,
+            embedding BLOB DEFAULT NULL,
+            PRIMARY KEY (user_id, topic)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_memory_user
+            ON user_memory_topics(user_id);
+
+        CREATE TABLE IF NOT EXISTS user_agent_memory_topics (
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, agent_id, topic)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_agent_memory
+            ON user_agent_memory_topics(user_id, agent_id);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (10, datetime('now'), 'Structured memory storage tables (session_extractions, user_memory_topics, user_agent_memory_topics)');
+        ",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +559,140 @@ mod tests {
             .unwrap();
         assert_eq!(uid, "00000000-0000-0000-0000-000000000000");
         assert!(parent.is_none());
+    }
+
+    // ── v10: Structured-memory storage ──────────────────────────────────
+
+    #[test]
+    fn test_migration_v10_creates_storage_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"session_extractions".to_string()));
+        assert!(tables.contains(&"user_memory_topics".to_string()));
+        assert!(tables.contains(&"user_agent_memory_topics".to_string()));
+    }
+
+    #[test]
+    fn test_migration_v10_session_extractions_columns_denormalized() {
+        // user_id and agent_id are denormalized onto the row from the start —
+        // no v15 backfill needed because PR 2 ships the table this way.
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "session_extractions", "user_id"));
+        assert!(column_exists(&conn, "session_extractions", "agent_id"));
+        assert!(column_exists(&conn, "session_extractions", "session_id"));
+        assert!(column_exists(&conn, "session_extractions", "facts"));
+        assert!(column_exists(&conn, "session_extractions", "preferences"));
+        assert!(column_exists(&conn, "session_extractions", "decisions"));
+        assert!(column_exists(&conn, "session_extractions", "tasks"));
+        assert!(column_exists(&conn, "session_extractions", "open_items"));
+        assert!(column_exists(&conn, "session_extractions", "created_at"));
+    }
+
+    #[test]
+    fn test_migration_v10_user_memory_topics_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // expires_at and embedding are present from the start so prune-at-read
+        // and similarity-search code paths compile and run.
+        assert!(column_exists(&conn, "user_memory_topics", "user_id"));
+        assert!(column_exists(&conn, "user_memory_topics", "topic"));
+        assert!(column_exists(&conn, "user_memory_topics", "summary"));
+        assert!(column_exists(&conn, "user_memory_topics", "content"));
+        assert!(column_exists(&conn, "user_memory_topics", "updated_at"));
+        assert!(column_exists(&conn, "user_memory_topics", "expires_at"));
+        assert!(column_exists(&conn, "user_memory_topics", "embedding"));
+    }
+
+    #[test]
+    fn test_migration_v10_user_agent_memory_topics_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "user_agent_memory_topics", "user_id"));
+        assert!(column_exists(&conn, "user_agent_memory_topics", "agent_id"));
+        assert!(column_exists(&conn, "user_agent_memory_topics", "topic"));
+        assert!(column_exists(&conn, "user_agent_memory_topics", "summary"));
+        assert!(column_exists(&conn, "user_agent_memory_topics", "content"));
+        assert!(column_exists(
+            &conn,
+            "user_agent_memory_topics",
+            "updated_at"
+        ));
+    }
+
+    #[test]
+    fn test_migration_v10_indexes_present() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(names.contains(&"idx_extractions_session".to_string()));
+        assert!(names.contains(&"idx_extractions_user_created".to_string()));
+        assert!(names.contains(&"idx_user_memory_user".to_string()));
+        assert!(names.contains(&"idx_user_agent_memory".to_string()));
+    }
+
+    /// A v9 database (PR 1 tip) must upgrade cleanly to v10: the three new
+    /// tables appear without touching pre-existing rows.
+    #[test]
+    fn test_migration_v9_to_v10_upgrade_preserves_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Stop at v9 (PR 1 baseline).
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        migrate_v8(&conn).unwrap();
+        migrate_v9(&conn).unwrap();
+        set_schema_version(&conn, 9).unwrap();
+
+        // Insert a v9 session row — nothing here should be touched by v10.
+        conn.execute(
+            "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, user_id, created_at, updated_at) \
+             VALUES ('sess-v9', 'agent-v9', X'', 0, '11111111-1111-1111-1111-111111111111', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        // Apply v10.
+        run_migrations(&conn).unwrap();
+
+        // New tables exist.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"session_extractions".to_string()));
+        assert!(tables.contains(&"user_memory_topics".to_string()));
+        assert!(tables.contains(&"user_agent_memory_topics".to_string()));
+
+        // Pre-existing session row untouched.
+        let uid: String = conn
+            .query_row(
+                "SELECT user_id FROM sessions WHERE id = 'sess-v9'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uid, "11111111-1111-1111-1111-111111111111");
     }
 }

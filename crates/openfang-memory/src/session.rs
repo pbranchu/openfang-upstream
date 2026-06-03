@@ -214,6 +214,57 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Get all direct child session IDs for a parent session.
+    ///
+    /// Uses the `parent_session_id` column added in v9 (PR 1). The producer
+    /// that actually forks sessions (hand sessions linked to callers) lands
+    /// in a later PR — until then this returns empty for every input.
+    pub fn get_child_sessions(
+        &self,
+        parent_session_id: SessionId,
+    ) -> OpenFangResult<Vec<SessionId>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM sessions WHERE parent_session_id = ?1")
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![parent_session_id.0.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            let id_str = row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let session_id = uuid::Uuid::parse_str(&id_str)
+                .map(SessionId)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            ids.push(session_id);
+        }
+        Ok(ids)
+    }
+
+    /// Delete a session and all its descendants recursively.
+    ///
+    /// Returns the total number of sessions deleted (including the root).
+    /// No forks exist today so this is functionally equivalent to
+    /// `delete_session`; once the fork producer lands, every descendant is
+    /// pulled in via the `parent_session_id` link.
+    pub fn delete_session_tree(&self, root_session_id: SessionId) -> OpenFangResult<usize> {
+        let children = self.get_child_sessions(root_session_id)?;
+        let mut count = 0;
+        for child_id in children {
+            count += self.delete_session_tree(child_id)?;
+        }
+        self.delete_session(root_session_id)?;
+        count += 1;
+        Ok(count)
+    }
+
     /// Delete all sessions belonging to an agent.
     pub fn delete_agent_sessions(&self, agent_id: AgentId) -> OpenFangResult<()> {
         let conn = self
@@ -746,6 +797,165 @@ impl SessionStore {
             file.write_all(b"\n")?;
         }
 
+        Ok(())
+    }
+}
+
+/// A structured extraction pass result stored mid-session during compaction.
+///
+/// Populated by the (not-yet-landed) producer in a later PR. This PR provides
+/// the type and the storage backend so the surrounding plumbing — control
+/// API, wipe, audit — can be wired up independently of the producer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct SessionExtraction {
+    pub facts: Vec<String>,
+    pub preferences: Vec<String>,
+    pub decisions: Vec<String>,
+    pub tasks: Vec<String>,
+    pub open_items: Vec<String>,
+}
+
+/// Store for session extractions (compaction outputs).
+///
+/// Each `append` denormalizes the session's owning `user_id` and `agent_id`
+/// onto the extraction row so the audit endpoint can attribute the event
+/// even after the originating session is deleted. The audit query joins
+/// against `sessions` purely to surface the `session_deleted` flag, not for
+/// attribution.
+#[derive(Clone)]
+pub struct SessionExtractionStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SessionExtractionStore {
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    /// Append a new extraction record for a session.
+    ///
+    /// Looks up the owning `user_id`/`agent_id` from the `sessions` table and
+    /// denormalizes them onto the extraction row so the audit endpoint can
+    /// attribute the event correctly even after the session is deleted. If
+    /// the session is missing (shouldn't happen in normal flow — extractions
+    /// are written by code that just loaded the session) we fall back to the
+    /// nil UUID.
+    pub fn append(
+        &self,
+        session_id: SessionId,
+        extraction: &SessionExtraction,
+    ) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let facts = serde_json::to_string(&extraction.facts)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let preferences = serde_json::to_string(&extraction.preferences)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let decisions = serde_json::to_string(&extraction.decisions)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let tasks = serde_json::to_string(&extraction.tasks)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let open_items = serde_json::to_string(&extraction.open_items)
+            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+
+        // Resolve owning user/agent for the audit-friendly denormalized columns.
+        let nil = uuid::Uuid::nil().to_string();
+        let (user_id, agent_id): (String, String) = conn
+            .query_row(
+                "SELECT user_id, agent_id FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id.0.to_string()],
+                |row| {
+                    let u: Option<String> = row.get(0).ok();
+                    let a: Option<String> = row.get(1).ok();
+                    Ok((
+                        u.unwrap_or_else(|| nil.clone()),
+                        a.unwrap_or_else(|| nil.clone()),
+                    ))
+                },
+            )
+            .unwrap_or_else(|_| (nil.clone(), nil.clone()));
+
+        conn.execute(
+            "INSERT INTO session_extractions \
+                (id, session_id, facts, preferences, decisions, tasks, open_items, created_at, user_id, agent_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                id,
+                session_id.0.to_string(),
+                facts,
+                preferences,
+                decisions,
+                tasks,
+                open_items,
+                now,
+                user_id,
+                agent_id,
+            ],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load all extractions for a session, ordered by created_at.
+    pub fn load_all(&self, session_id: SessionId) -> OpenFangResult<Vec<SessionExtraction>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT facts, preferences, decisions, tasks, open_items \
+                 FROM session_extractions WHERE session_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![session_id.0.to_string()], |row| {
+                let facts: String = row.get(0)?;
+                let preferences: String = row.get(1)?;
+                let decisions: String = row.get(2)?;
+                let tasks: String = row.get(3)?;
+                let open_items: String = row.get(4)?;
+                Ok((facts, preferences, decisions, tasks, open_items))
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut extractions = Vec::new();
+        for row in rows {
+            let (facts, preferences, decisions, tasks, open_items) =
+                row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let extraction = SessionExtraction {
+                facts: serde_json::from_str(&facts)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?,
+                preferences: serde_json::from_str(&preferences)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?,
+                decisions: serde_json::from_str(&decisions)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?,
+                tasks: serde_json::from_str(&tasks)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?,
+                open_items: serde_json::from_str(&open_items)
+                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?,
+            };
+            extractions.push(extraction);
+        }
+        Ok(extractions)
+    }
+
+    /// Delete all extractions for a session.
+    pub fn delete_for_session(&self, session_id: SessionId) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM session_extractions WHERE session_id = ?1",
+            rusqlite::params![session_id.0.to_string()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
     }
 }

@@ -526,6 +526,71 @@ fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
     }
 }
 
+/// Build the user-memory context block for injection into the system prompt.
+///
+/// Combines general user topics and per-agent user topics into a concise
+/// index with a human-readable "age" for staleness reasoning. The block is
+/// rendered later by `prompt_builder` under the `## What I Remember About
+/// You` heading.
+///
+/// **Opt-in gate:** returns `None` immediately (no DB roundtrip) when the
+/// agent has not opted in to structured memory
+/// (`MemoryConfig::is_structured() == false`). The default
+/// `MemorySystem::Summarization` writes nothing to the user-memory stores,
+/// so the result would always be empty anyway — exiting early avoids the
+/// SQLite read on every prompt build for upstream-shape agents.
+fn build_user_memory_context(
+    memory: &openfang_memory::MemorySubstrate,
+    user_id: openfang_types::agent::UserId,
+    agent_id: AgentId,
+    memory_cfg: &openfang_types::agent::MemoryConfig,
+) -> Option<String> {
+    if !memory_cfg.is_structured() {
+        return None;
+    }
+    let user_topics = memory.user_topic_index(user_id).unwrap_or_default();
+    let agent_topics = memory
+        .user_agent_topic_index(user_id, agent_id)
+        .unwrap_or_default();
+
+    if user_topics.is_empty() && agent_topics.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    for t in &user_topics {
+        let age = format_memory_age(t.updated_at);
+        lines.push(format!("- **{}** — {} ({})", t.topic, t.summary, age));
+    }
+    for t in &agent_topics {
+        let age = format_memory_age(t.updated_at);
+        lines.push(format!(
+            "- **{}** [with me] — {} ({})",
+            t.topic, t.summary, age
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+/// Format a UTC timestamp as a human-readable age string
+/// (e.g. "3 days ago", "just now"). Used by `build_user_memory_context`.
+fn format_memory_age(updated_at: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = (chrono::Utc::now() - updated_at).num_seconds();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{} hr ago", secs / 3600)
+    } else if secs < 86400 * 7 {
+        format!("{} days ago", secs / 86400)
+    } else if secs < 86400 * 30 {
+        format!("{} weeks ago", secs / (86400 * 7))
+    } else {
+        format!("{} months ago", secs / (86400 * 30))
+    }
+}
+
 /// Get the system hostname as a String.
 fn gethostname() -> Option<String> {
     #[cfg(unix)]
@@ -2302,6 +2367,15 @@ impl OpenFangKernel {
                 context_md: manifest.workspace.as_ref().and_then(|w| {
                     openfang_runtime::agent_context::load_context_md(w, manifest.cache_context)
                 }),
+                // Gated on `manifest.memory.is_structured()` — returns None
+                // immediately for default-Summarization agents so the SQLite
+                // round-trip is skipped on the hot path.
+                user_memory_context: build_user_memory_context(
+                    &self.memory,
+                    session.user_id,
+                    agent_id,
+                    &manifest.memory,
+                ),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2885,6 +2959,14 @@ impl OpenFangKernel {
                 context_md: manifest.workspace.as_ref().and_then(|w| {
                     openfang_runtime::agent_context::load_context_md(w, manifest.cache_context)
                 }),
+                // Gated on `manifest.memory.is_structured()` — see the helper
+                // for the early-return rationale.
+                user_memory_context: build_user_memory_context(
+                    &self.memory,
+                    session.user_id,
+                    agent_id,
+                    &manifest.memory,
+                ),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -3890,6 +3972,8 @@ impl OpenFangKernel {
             } else {
                 None
             },
+            // Propagate hand's per-agent memory opt-in to the spawned manifest.
+            memory: def.agent.memory.clone(),
             ..Default::default()
         };
 
@@ -8190,6 +8274,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            memory: openfang_types::agent::MemoryConfig::default(),
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -8234,6 +8319,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            memory: openfang_types::agent::MemoryConfig::default(),
         };
         let mut disk = entry.clone();
         disk.description = "new".to_string();
@@ -8285,6 +8371,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            memory: openfang_types::agent::MemoryConfig::default(),
         };
         let mut disk = entry.clone();
         disk.workspace = Some(std::path::PathBuf::from("/new"));
@@ -8342,6 +8429,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            memory: openfang_types::agent::MemoryConfig::default(),
         };
 
         // Current kernel config now says mode = Full.
@@ -8456,6 +8544,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            memory: openfang_types::agent::MemoryConfig::default(),
         }
     }
 
@@ -9856,6 +9945,97 @@ system_prompt = "You are a test agent."
             .expect("create session");
         assert_eq!(session.user_id, alice);
         assert_ne!(session.user_id, kernel.default_user_id());
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------
+    // build_user_memory_context — the opt-in gate that decides whether
+    // structured memory bleeds into the system prompt.
+    // -----------------------------------------------------------------
+
+    /// Default agents (no `[memory]` block, or `system = "summarization"`)
+    /// MUST return `None` from the helper without touching SQLite. This is the
+    /// core upstream-compatibility guarantee of the structured-memory feature.
+    #[test]
+    fn test_build_user_memory_context_returns_none_for_default_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = minimal_kernel(&tmp);
+        let agent_id = openfang_types::agent::AgentId::new();
+        let user_id = openfang_types::agent::UserId::new();
+        let default_cfg = openfang_types::agent::MemoryConfig::default();
+
+        // Seed a topic — the helper must STILL return None because the gate
+        // is on the memory config, not on the contents of the store.
+        kernel
+            .memory
+            .upsert_user_topic(&openfang_memory::user_memory::MemoryTopic {
+                user_id,
+                topic: "prefs".into(),
+                summary: "summary".into(),
+                content: "content".into(),
+                updated_at: chrono::Utc::now(),
+                expires_at: None,
+            })
+            .unwrap();
+
+        let result = build_user_memory_context(&kernel.memory, user_id, agent_id, &default_cfg);
+        assert!(
+            result.is_none(),
+            "default-Summarization agents must skip the user-memory block"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Opted-in agents WITH topics return the formatted index.
+    #[test]
+    fn test_build_user_memory_context_populated_for_opted_in_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = minimal_kernel(&tmp);
+        let agent_id = openfang_types::agent::AgentId::new();
+        let user_id = openfang_types::agent::UserId::new();
+        let structured_cfg = openfang_types::agent::MemoryConfig {
+            system: openfang_types::agent::MemorySystem::Structured,
+        };
+
+        kernel
+            .memory
+            .upsert_user_topic(&openfang_memory::user_memory::MemoryTopic {
+                user_id,
+                topic: "prefs".into(),
+                summary: "likes tea".into(),
+                content: "details".into(),
+                updated_at: chrono::Utc::now(),
+                expires_at: None,
+            })
+            .unwrap();
+
+        let result =
+            build_user_memory_context(&kernel.memory, user_id, agent_id, &structured_cfg).unwrap();
+        assert!(result.contains("prefs"));
+        assert!(result.contains("likes tea"));
+
+        kernel.shutdown();
+    }
+
+    /// Opted-in agent with no stored topics returns `None` (empty index
+    /// shouldn't add a noisy empty section to the prompt).
+    #[test]
+    fn test_build_user_memory_context_none_when_no_topics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = minimal_kernel(&tmp);
+        let agent_id = openfang_types::agent::AgentId::new();
+        let user_id = openfang_types::agent::UserId::new();
+        let structured_cfg = openfang_types::agent::MemoryConfig {
+            system: openfang_types::agent::MemorySystem::Structured,
+        };
+
+        let result = build_user_memory_context(&kernel.memory, user_id, agent_id, &structured_cfg);
+        assert!(
+            result.is_none(),
+            "empty index should yield None, not an empty block"
+        );
 
         kernel.shutdown();
     }
