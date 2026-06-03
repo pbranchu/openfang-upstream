@@ -5283,32 +5283,34 @@ impl OpenFangKernel {
         let config = CompactionConfig::default();
         let existing_extractions = self.memory.load_extractions(session_id).unwrap_or_default();
 
-        // Always run a final extraction to capture anything since last compaction
+        // Resolve the driver up front. We do NOT fall back to StubDriver because
+        // StubDriver.complete() always errors, which burns the full retry budget
+        // inside extract_structured and emits noisy warns. If no driver is
+        // available, the dream pass is meaningless — return early to match the
+        // pattern used later in this function.
+        let driver = match self.resolve_driver(&entry.manifest) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(agent_id = %agent_id, "Dream: skipping — no LLM driver available: {e}");
+                return;
+            }
+        };
+
+        // Always run a final extraction to capture anything since last compaction.
+        // `extract_structured` is infallible: internal failures fall back to the
+        // existing extraction (or default) and never error.
         let final_extraction = if !session.messages.is_empty() {
             let existing = existing_extractions.last().cloned();
-            match extract_structured(
-                self.resolve_driver(&entry.manifest)
-                    .ok()
-                    .unwrap_or_else(|| {
-                        Arc::new(crate::kernel::StubDriver)
-                            as Arc<dyn openfang_runtime::llm_driver::LlmDriver>
-                    }),
+            let extraction = extract_structured(
+                driver.clone(),
                 &entry.manifest.model.model,
                 &session.messages,
                 existing.as_ref(),
                 &config,
             )
-            .await
-            {
-                Ok(extraction) => {
-                    let _ = self.memory.append_extraction(session_id, &extraction);
-                    extraction
-                }
-                Err(e) => {
-                    warn!(agent_id = %agent_id, "Dream: final extraction failed: {e}");
-                    existing_extractions.last().cloned().unwrap_or_default()
-                }
-            }
+            .await;
+            let _ = self.memory.append_extraction(session_id, &extraction);
+            extraction
         } else {
             existing_extractions.last().cloned().unwrap_or_default()
         };
@@ -5339,14 +5341,6 @@ impl OpenFangKernel {
                     .map(|t| (entry.topic, t.content))
             })
             .collect();
-
-        let driver = match self.resolve_driver(&entry.manifest) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(agent_id = %agent_id, "Dream: no driver available: {e}");
-                return;
-            }
-        };
 
         // Take the last ~20 messages as the "recent tail" (not compacted)
         let recent_tail: Vec<_> = session

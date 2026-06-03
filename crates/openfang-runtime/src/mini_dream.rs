@@ -45,14 +45,10 @@ pub async fn run_mini_dream(
         "Mini-dream: extracting facts from messages about to be trimmed"
     );
 
-    // Step 1: Structured extraction from the messages being trimmed
-    let extraction = match extract_structured(driver.clone(), model, messages, None, config).await {
-        Ok(e) => e,
-        Err(e) => {
-            warn!("Mini-dream: structured extraction failed: {e}");
-            return 0;
-        }
-    };
+    // Step 1: Structured extraction from the messages being trimmed.
+    // `extract_structured` is infallible — internal LLM/parse failures fall back
+    // to an empty extraction, which the emptiness check below skips.
+    let extraction = extract_structured(driver.clone(), model, messages, None, config).await;
 
     // Nothing worth persisting — skip the dream LLM call
     if extraction.facts.is_empty()

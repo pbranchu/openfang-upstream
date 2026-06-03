@@ -130,13 +130,16 @@ pub fn count_tool_calls(messages: &[Message]) -> usize {
 /// On LLM error or persistent parse failure, returns the `existing` extraction
 /// (or `SessionExtraction::default()`) rather than propagating an error — the
 /// extraction path is non-critical and must never fail the agent turn.
+///
+/// Signature is infallible by design: every failure mode falls back to the
+/// existing extraction (or an empty one). Callers do not need error handling.
 pub async fn extract_structured(
     driver: Arc<dyn LlmDriver>,
     model: &str,
     messages: &[Message],
     existing: Option<&SessionExtraction>,
     config: &CompactionConfig,
-) -> Result<SessionExtraction, String> {
+) -> SessionExtraction {
     // Filter out context injection messages
     let filtered: Vec<&Message> = messages
         .iter()
@@ -230,7 +233,7 @@ pub async fn extract_structured(
                 match serde_json::from_str::<SessionExtraction>(json_str) {
                     Ok(extraction) => {
                         info!("Structured extraction complete");
-                        return Ok(extraction);
+                        return extraction;
                     }
                     Err(e) => {
                         warn!(attempt, error = %e, "Failed to parse structured extraction JSON, retrying");
@@ -245,7 +248,7 @@ pub async fn extract_structured(
 
     // All retries failed — return existing or empty rather than erroring
     warn!("Structured extraction failed after all retries, returning fallback");
-    Ok(fallback())
+    fallback()
 }
 
 /// Estimate token count for a set of messages, optional system prompt, and tool definitions.
@@ -1834,8 +1837,7 @@ mod tests {
             Some(&existing),
             &config,
         )
-        .await
-        .unwrap();
+        .await;
 
         // Returns the existing extraction as fallback
         assert_eq!(result.facts, vec!["User likes Rust".to_string()]);
