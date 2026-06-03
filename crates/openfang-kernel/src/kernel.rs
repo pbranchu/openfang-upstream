@@ -178,6 +178,10 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Last-activity timestamp per agent — populated on every successful agent
+    /// loop completion. The session lifecycle loop polls this to detect idle
+    /// sessions and trigger dream consolidation for structured-memory agents.
+    agent_last_active: dashmap::DashMap<AgentId, std::time::Instant>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1304,6 +1308,7 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            agent_last_active: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
         };
 
@@ -2027,6 +2032,10 @@ impl OpenFangKernel {
                 // Record token usage for quota tracking
                 self.scheduler.record_usage(agent_id, &result.total_usage);
 
+                // Update last-active time for the session lifecycle / dream trigger.
+                self.agent_last_active
+                    .insert(agent_id, std::time::Instant::now());
+
                 // Update last active time
                 let _ = self.registry.set_state(agent_id, AgentState::Running);
 
@@ -2127,6 +2136,9 @@ impl OpenFangKernel {
                         kernel_clone
                             .scheduler
                             .record_usage(agent_id, &result.total_usage);
+                        kernel_clone
+                            .agent_last_active
+                            .insert(agent_id, std::time::Instant::now());
                         let _ = kernel_clone
                             .registry
                             .set_state(agent_id, AgentState::Running);
@@ -2537,6 +2549,10 @@ impl OpenFangKernel {
                             cost_usd: cost,
                             tool_calls: result.iterations.saturating_sub(1),
                         });
+
+                    kernel_clone
+                        .agent_last_active
+                        .insert(agent_id, std::time::Instant::now());
 
                     let _ = kernel_clone
                         .registry
@@ -4590,6 +4606,23 @@ impl OpenFangKernel {
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
 
+        // Session lifecycle: inactivity detection and dream consolidation.
+        //
+        // The dreamer background loop runs kernel-wide; per-agent gating happens
+        // inside `trigger_session_dream` via `manifest.memory.is_structured()`,
+        // so default (Summarization) agents are no-ops even when their last-active
+        // timestamp expires. Set `[sessions] gap_secs = 0` to disable entirely.
+        if self.config.sessions.gap_secs > 0 {
+            let kernel = Arc::clone(self);
+            tokio::spawn(async move {
+                kernel.run_session_lifecycle_loop().await;
+            });
+            info!(
+                gap_secs = self.config.sessions.gap_secs,
+                "Session lifecycle monitor started"
+            );
+        }
+
         // Start OFP peer node if network is enabled
         if self.config.network_enabled && !self.config.network.shared_secret.is_empty() {
             let kernel = Arc::clone(self);
@@ -5110,6 +5143,279 @@ impl OpenFangKernel {
         });
 
         info!("Heartbeat monitor started (interval: {}s)", interval_secs);
+    }
+
+    /// Background loop: check for inactive agent sessions and trigger dream consolidation.
+    ///
+    /// Wakes up every 30 seconds. For each agent that has been idle longer than
+    /// `sessions.gap_secs`, triggers the dream pass (structured extraction →
+    /// user memory consolidation) and removes the agent from the active map.
+    ///
+    /// The per-agent `manifest.memory.is_structured()` gate inside
+    /// `trigger_session_dream` ensures default agents are no-ops even if they
+    /// briefly show up in `agent_last_active` from a turn that ran before the
+    /// opt-in check.
+    async fn run_session_lifecycle_loop(self: &Arc<Self>) {
+        let check_interval = std::time::Duration::from_secs(30);
+        let inactivity_threshold = std::time::Duration::from_secs(self.config.sessions.gap_secs);
+
+        let mut interval = tokio::time::interval(check_interval);
+        interval.tick().await; // Skip initial tick
+
+        loop {
+            interval.tick().await;
+            if self.supervisor.is_shutting_down() {
+                break;
+            }
+
+            let now = std::time::Instant::now();
+            let expired: Vec<AgentId> = self
+                .agent_last_active
+                .iter()
+                .filter(|entry| now.duration_since(*entry.value()) >= inactivity_threshold)
+                .map(|entry| *entry.key())
+                .collect();
+
+            for agent_id in expired {
+                self.agent_last_active.remove(&agent_id);
+                let kernel = Arc::clone(self);
+                tokio::spawn(async move {
+                    kernel.trigger_session_dream(agent_id).await;
+                });
+            }
+        }
+    }
+
+    /// Run the dream pass for an agent session that has gone idle.
+    ///
+    /// Loads the session's structured extractions (accumulated during compaction passes),
+    /// plus the recent message tail, and consolidates into topic-organized user memory.
+    ///
+    /// Gates:
+    /// - The agent must opt in to structured memory (`manifest.memory.is_structured()`).
+    /// - The session must contain *real* user activity — pure autonomous-tick sessions
+    ///   (where the only inputs are `[AUTONOMOUS TICK]` / `[SCHEDULED TICK]` prompts or
+    ///   `ContextInjection` messages) are skipped to avoid the thundering-herd problem
+    ///   that surfaced in production when every heartbeat fired a dream.
+    pub async fn trigger_session_dream(self: &Arc<Self>, agent_id: AgentId) {
+        use openfang_memory::user_memory::MemoryTopic;
+        use openfang_runtime::compactor::{extract_structured, CompactionConfig};
+        use openfang_runtime::dreamer::dream;
+
+        let entry = match self.registry.get(agent_id) {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Gate: dream consolidation only runs for agents that have opted in
+        // to structured memory. Agents on the default Summarization path never
+        // accumulate extractions, so there is nothing to consolidate.
+        if !entry.manifest.memory.is_structured() {
+            debug!(
+                agent_id = %agent_id,
+                "Dream: skipping — agent memory.system is not structured"
+            );
+            return;
+        }
+
+        let session = match self.memory.get_session(entry.session_id) {
+            Ok(Some(s)) => s,
+            _ => return,
+        };
+
+        if session.messages.is_empty() {
+            return;
+        }
+
+        // Skip dream if the session had no real user activity — only autonomous
+        // tick prompts or context injections. A pure-tick session (heartbeat fires,
+        // agent responds NO_REPLY, nothing else) is not worth consolidating.
+        // This is the activity-gating fix from production (commit aa4ec5c on branchu).
+        let has_real_activity = session.messages.iter().any(|msg| {
+            if msg.role != openfang_types::message::Role::User {
+                return false;
+            }
+            if msg.source == Some(openfang_types::message::MessageSource::ContextInjection) {
+                return false;
+            }
+            let text = msg.content.text_content();
+            !text.starts_with("[AUTONOMOUS TICK]") && !text.starts_with("[SCHEDULED TICK]")
+        });
+
+        if !has_real_activity {
+            debug!(
+                agent_id = %agent_id,
+                messages = session.messages.len(),
+                "Dream: skipping — no real user activity in session"
+            );
+            return;
+        }
+
+        let user_id = session.user_id;
+        let session_id = session.id;
+
+        info!(
+            agent_id = %agent_id,
+            session_id = %session_id,
+            messages = session.messages.len(),
+            "Dream: session idle, starting consolidation"
+        );
+
+        // Run a final extraction pass if needed
+        let config = CompactionConfig::default();
+        let existing_extractions = self.memory.load_extractions(session_id).unwrap_or_default();
+
+        // Always run a final extraction to capture anything since last compaction
+        let final_extraction = if !session.messages.is_empty() {
+            let existing = existing_extractions.last().cloned();
+            match extract_structured(
+                self.resolve_driver(&entry.manifest)
+                    .ok()
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::kernel::StubDriver)
+                            as Arc<dyn openfang_runtime::llm_driver::LlmDriver>
+                    }),
+                &entry.manifest.model.model,
+                &session.messages,
+                existing.as_ref(),
+                &config,
+            )
+            .await
+            {
+                Ok(extraction) => {
+                    let _ = self.memory.append_extraction(session_id, &extraction);
+                    extraction
+                }
+                Err(e) => {
+                    warn!(agent_id = %agent_id, "Dream: final extraction failed: {e}");
+                    existing_extractions.last().cloned().unwrap_or_default()
+                }
+            }
+        } else {
+            existing_extractions.last().cloned().unwrap_or_default()
+        };
+
+        // Reload all extractions including the new one
+        let all_extractions = self.memory.load_extractions(session_id).unwrap_or_default();
+
+        if all_extractions.is_empty()
+            && final_extraction.facts.is_empty()
+            && final_extraction.preferences.is_empty()
+        {
+            debug!(agent_id = %agent_id, "Dream: no content to consolidate, skipping");
+            return;
+        }
+
+        // Load existing user memory topics (name + full content) for conflict detection.
+        // The dream prompt uses these to detect contradictions and emit a `supersedes` list.
+        let existing_topics: Vec<(String, String)> = self
+            .memory
+            .user_topic_index(user_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                self.memory
+                    .user_topic(user_id, &entry.topic)
+                    .ok()
+                    .flatten()
+                    .map(|t| (entry.topic, t.content))
+            })
+            .collect();
+
+        let driver = match self.resolve_driver(&entry.manifest) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(agent_id = %agent_id, "Dream: no driver available: {e}");
+                return;
+            }
+        };
+
+        // Take the last ~20 messages as the "recent tail" (not compacted)
+        let recent_tail: Vec<_> = session
+            .messages
+            .iter()
+            .rev()
+            .take(20)
+            .cloned()
+            .rev()
+            .collect();
+
+        match dream(
+            driver,
+            &entry.manifest.model.model,
+            &all_extractions,
+            &recent_tail,
+            user_id,
+            &existing_topics,
+            &config,
+        )
+        .await
+        {
+            Ok(result) => {
+                info!(
+                    agent_id = %agent_id,
+                    topics = result.topics.len(),
+                    superseded = result.superseded_topics.len(),
+                    "Dream: consolidation complete, persisting topics"
+                );
+
+                // Delete superseded topics before writing new ones (conflict resolution).
+                for superseded in &result.superseded_topics {
+                    if let Err(e) = self.memory.delete_user_topic(user_id, superseded) {
+                        warn!(agent_id = %agent_id, topic = %superseded, "Dream: failed to delete superseded topic: {e}");
+                    } else {
+                        info!(agent_id = %agent_id, topic = %superseded, "Dream: deleted superseded topic");
+                    }
+                }
+
+                // Write new topics, propagating expires_at from dream output.
+                let now = chrono::Utc::now();
+                for dt in &result.topics {
+                    let expires_at = dt
+                        .expires_at
+                        .as_deref()
+                        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+                    let topic = MemoryTopic {
+                        user_id,
+                        topic: dt.topic.clone(),
+                        summary: dt.summary.clone(),
+                        content: dt.content.clone(),
+                        updated_at: now,
+                        expires_at,
+                    };
+                    if let Err(e) = self.memory.upsert_user_topic(&topic) {
+                        warn!(agent_id = %agent_id, topic = %dt.topic, "Dream: failed to persist topic: {e}");
+                        continue;
+                    }
+                    // Embed the topic content for semantic retrieval.
+                    if let Some(emb) = &self.embedding_driver {
+                        match emb.embed_one(&dt.content).await {
+                            Ok(vec) => {
+                                if let Err(e) = self
+                                    .memory
+                                    .store_user_topic_embedding(user_id, &dt.topic, &vec)
+                                {
+                                    warn!(agent_id = %agent_id, topic = %dt.topic, "Dream: failed to store embedding: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(agent_id = %agent_id, topic = %dt.topic, "Dream: embedding failed: {e}");
+                            }
+                        }
+                    }
+                }
+
+                // Prune any expired topics left over from previous sessions.
+                if let Ok(n) = self.memory.prune_expired_user_topics(user_id) {
+                    if n > 0 {
+                        info!(agent_id = %agent_id, pruned = n, "Dream: pruned expired topics");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(agent_id = %agent_id, "Dream: consolidation failed: {e}");
+            }
+        }
     }
 
     /// Start the background loop / register triggers for a single agent.

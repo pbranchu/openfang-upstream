@@ -307,6 +307,22 @@ impl Message {
         }
     }
 
+    /// Create a context-injection message (tagged for exclusion from dream).
+    ///
+    /// Context-injection messages carry calendar / email / heartbeat summaries
+    /// that should be visible to the LLM at runtime but excluded from the
+    /// structured-memory extraction pipeline so they do not bleed into
+    /// long-term user memory.
+    pub fn context_injection(content: impl Into<String>) -> Self {
+        Self {
+            msg_id: new_msg_id(),
+            provider_msg_id: None,
+            role: Role::User,
+            content: MessageContent::Text(content.into()),
+            source: Some(MessageSource::ContextInjection),
+        }
+    }
+
     /// Create an assistant message with structured content blocks.
     ///
     /// Used to preserve `Thinking` blocks (with signatures and reasoning text)

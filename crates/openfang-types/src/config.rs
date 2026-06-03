@@ -1305,6 +1305,39 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+    /// Session lifecycle configuration (inactivity timeouts → dream trigger).
+    #[serde(default)]
+    pub sessions: SessionsConfig,
+}
+
+/// Session lifecycle configuration.
+///
+/// Controls how long a session can sit idle before the kernel triggers
+/// dream consolidation (structured-memory agents only).
+///
+/// ```toml
+/// [sessions]
+/// gap_secs = 900          # inactivity → session end + dream (default 300)
+/// email_gap_secs = 86400  # longer timeout for async channels
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Seconds of inactivity before a session is considered ended and dream is triggered.
+    /// Default: 300 (5 minutes). Set to 0 to disable the dream lifecycle loop entirely.
+    pub gap_secs: u64,
+    /// Longer inactivity timeout for async channels like email.
+    /// Default: 86400 (24 hours). Reserved for future channel-aware gating.
+    pub email_gap_secs: u64,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            gap_secs: 300,
+            email_gap_secs: 86_400,
+        }
+    }
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1547,6 +1580,7 @@ impl Default for KernelConfig {
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
             skills: HashMap::new(),
+            sessions: SessionsConfig::default(),
         }
     }
 }

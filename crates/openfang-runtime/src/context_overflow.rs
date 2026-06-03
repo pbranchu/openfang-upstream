@@ -111,6 +111,38 @@ fn estimate_tokens(messages: &[Message], system_prompt: &str, tools: &[ToolDefin
     crate::compactor::estimate_token_count(messages, Some(system_prompt), Some(tools))
 }
 
+/// Returns the number of leading messages that overflow recovery would drain,
+/// without actually applying the trim.
+///
+/// 0 means no recovery needed. The caller can run mini-dream on `messages[..n]`
+/// before calling `recover_from_overflow` to preserve facts before discard.
+pub fn overflow_drain_count(
+    messages: &[Message],
+    system_prompt: &str,
+    tools: &[ToolDefinition],
+    context_window: usize,
+) -> usize {
+    let estimated = estimate_tokens(messages, system_prompt, tools);
+    let threshold_70 = (context_window as f64 * 0.70) as usize;
+    let threshold_90 = (context_window as f64 * 0.90) as usize;
+
+    if estimated <= threshold_70 {
+        return 0;
+    }
+
+    if estimated <= threshold_90 {
+        // Matches Stage 1: keep last 10
+        let keep = 10.min(messages.len());
+        let raw_remove = messages.len().saturating_sub(keep);
+        return safe_drain_boundary(messages, raw_remove);
+    }
+
+    // Matches Stage 2: keep last 4
+    let keep = 4.min(messages.len());
+    let raw_remove = messages.len().saturating_sub(keep);
+    safe_drain_boundary(messages, raw_remove)
+}
+
 /// Run the 4-stage overflow recovery pipeline.
 ///
 /// Returns the recovery stage applied and the number of messages/results affected.
