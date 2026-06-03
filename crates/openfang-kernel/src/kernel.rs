@@ -182,6 +182,13 @@ pub struct OpenFangKernel {
     /// loop completion. The session lifecycle loop polls this to detect idle
     /// sessions and trigger dream consolidation for structured-memory agents.
     agent_last_active: dashmap::DashMap<AgentId, std::time::Instant>,
+    /// Per-agent in-flight dream mutex — guarantees only one dream task runs
+    /// per agent at a time. The lifecycle loop calls `try_lock` so iterations
+    /// never queue: if a previous dream is still running, this tick is skipped
+    /// and the next tick (30s later) will re-check. Separate from
+    /// `agent_msg_locks` because a dream and a user turn for the same agent
+    /// must not block each other — only dream-vs-dream is serialized.
+    agent_dream_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
 }
@@ -1337,6 +1344,7 @@ impl OpenFangKernel {
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
             agent_last_active: dashmap::DashMap::new(),
+            agent_dream_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
         };
 
@@ -5207,7 +5215,23 @@ impl OpenFangKernel {
             for agent_id in expired {
                 self.agent_last_active.remove(&agent_id);
                 let kernel = Arc::clone(self);
+                // Per-agent in-flight dream mutex — if a previous dream task
+                // for this agent is still running, skip this iteration to
+                // avoid double-dispatch. We use `try_lock` (not `lock`) so
+                // tasks never queue: the next 30s tick will check again.
+                let dream_lock = self
+                    .agent_dream_locks
+                    .entry(agent_id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone();
                 tokio::spawn(async move {
+                    let Ok(_guard) = dream_lock.try_lock() else {
+                        debug!(
+                            agent_id = %agent_id,
+                            "Dream: skipping — previous dream still in flight"
+                        );
+                        return;
+                    };
                     kernel.trigger_session_dream(agent_id).await;
                 });
             }
@@ -10353,6 +10377,70 @@ system_prompt = "You are a test agent."
         assert!(
             result.is_none(),
             "empty index should yield None, not an empty block"
+        );
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------
+    // agent_dream_locks — per-agent serialization of dream tasks. Two
+    // concurrent dispatches for the same agent must not both run.
+    // -----------------------------------------------------------------
+
+    /// Two concurrent dream tasks for the same agent must not run in parallel:
+    /// `try_lock` skips the second when the first is still holding the per-agent
+    /// dream mutex. We simulate this by acquiring the mutex (mirroring an
+    /// in-flight dream) and confirming a subsequent `try_lock` fails. A second
+    /// agent gets its own mutex, so its `try_lock` succeeds.
+    #[tokio::test]
+    async fn test_agent_dream_locks_serialize_per_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = minimal_kernel(&tmp);
+
+        let agent_a = openfang_types::agent::AgentId::new();
+        let agent_b = openfang_types::agent::AgentId::new();
+
+        // Simulate dream task A acquiring its lock.
+        let lock_a = kernel
+            .agent_dream_locks
+            .entry(agent_a)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard_a = lock_a.lock().await;
+
+        // A second dispatch for agent A should be skipped: try_lock fails.
+        let lock_a_again = kernel
+            .agent_dream_locks
+            .entry(agent_a)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        assert!(
+            lock_a_again.try_lock().is_err(),
+            "concurrent dream for the same agent must be skipped (try_lock fails)"
+        );
+
+        // A dispatch for a different agent gets its own mutex — try_lock succeeds.
+        let lock_b = kernel
+            .agent_dream_locks
+            .entry(agent_b)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        assert!(
+            lock_b.try_lock().is_ok(),
+            "different agent must NOT be blocked by another agent's in-flight dream"
+        );
+
+        drop(_guard_a);
+
+        // Once A's lock is released, the next dispatch succeeds again.
+        let lock_a_after = kernel
+            .agent_dream_locks
+            .entry(agent_a)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        assert!(
+            lock_a_after.try_lock().is_ok(),
+            "released lock must allow the next dream dispatch through"
         );
 
         kernel.shutdown();
