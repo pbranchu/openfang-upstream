@@ -5204,6 +5204,12 @@ impl OpenFangKernel {
                 break;
             }
 
+            // NOTE: Race window — if a new turn finishes between the snapshot
+            // taken here and the per-agent `remove` below, the fresh timestamp
+            // is wiped. Result is a delayed `gap_secs` window (dream fires at
+            // the next tick instead of being suppressed by the new activity).
+            // The dream task itself reads the live session, so the content is
+            // correct; only the timing is briefly off — benign.
             let now = std::time::Instant::now();
             let expired: Vec<AgentId> = self
                 .agent_last_active

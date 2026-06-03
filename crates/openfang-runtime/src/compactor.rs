@@ -96,6 +96,15 @@ pub fn needs_compaction(session: &Session, config: &CompactionConfig) -> bool {
 
 /// Check whether a session needs structured extraction.
 /// Triggers on token count OR tool call count since last extraction.
+///
+/// TODO(PR4-or-later): wire this in once `agent_loop` tracks per-session
+/// `tokens_since_last_extraction` / `tool_calls_since_last_extraction`
+/// counters. Today the extraction is gated by the context-overflow path
+/// (`overflow_drain_count` → mini-dream), which is a different signal —
+/// proximity to the context window, not extraction cadence. Keeping this
+/// helper here so the policy lives next to `CompactionConfig`, but
+/// `#[allow(dead_code)]` until the call site lands.
+#[allow(dead_code)]
 pub fn needs_extraction(
     _messages_since_last: usize,
     tokens_since_last: usize,
@@ -108,6 +117,10 @@ pub fn needs_extraction(
 }
 
 /// Count the number of tool calls (ToolUse blocks) in a slice of messages.
+///
+/// TODO(PR4-or-later): wire into `agent_loop` alongside `needs_extraction`
+/// once per-session counters are tracked. See `needs_extraction` above.
+#[allow(dead_code)]
 pub fn count_tool_calls(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -491,7 +504,7 @@ fn is_oversized(message: &Message, config: &CompactionConfig) -> bool {
 ///
 /// Handles all content block types: text, tool use, tool result, image, unknown.
 /// Oversized messages are truncated inline with a marker.
-pub fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> String {
+pub(crate) fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> String {
     let mut conversation_text = String::new();
 
     for msg in messages {
