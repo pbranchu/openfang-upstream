@@ -1308,6 +1308,12 @@ pub struct KernelConfig {
     /// Session lifecycle configuration (inactivity timeouts → dream trigger).
     #[serde(default)]
     pub sessions: SessionsConfig,
+    /// Continuous compaction with contextual hand summaries.
+    ///
+    /// Independent of `[sessions]` — that knob controls the dream lifecycle
+    /// loop, this controls the compaction-and-context-refresh trigger.
+    #[serde(default)]
+    pub compaction: CompactionTomlConfig,
 }
 
 /// Session lifecycle configuration.
@@ -1336,6 +1342,89 @@ impl Default for SessionsConfig {
         Self {
             gap_secs: 300,
             email_gap_secs: 86_400,
+        }
+    }
+}
+
+/// A context source queried during continuous compaction to enrich the live
+/// session with time-bounded summaries from another agent (e.g. a calendar-hand
+/// or a mail-hand).
+///
+/// Configured via `[[compaction.context_sources]]` — only hands explicitly
+/// listed here are queried; nothing is called by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionContextSource {
+    /// Hand (agent name) to query for context.
+    pub hand: String,
+    /// Prompt sent to the hand. The kernel appends an explicit
+    /// `Time window: from … to …` clause so the hand can scope its summary.
+    pub prompt: String,
+}
+
+/// Configuration for continuous compaction with optional contextual hand summaries.
+///
+/// ```toml
+/// [compaction]
+/// continuous_interval = 5           # 0 disables continuous compaction
+/// keep_recent = 6                   # messages kept verbatim after compaction
+/// gap_secs = 900                    # 0 disables gap-triggered refresh
+/// gap_max_lookback_secs = 86400     # cap on the gap query window
+/// context_token_cap = 2000          # max combined hand-summary tokens to inject
+///
+/// [[compaction.context_sources]]
+/// hand = "calendar-hand"
+/// prompt = "Summarize events from the last few hours and any upcoming in the next 24 hours."
+///
+/// [[compaction.context_sources]]
+/// hand = "mail-hand"
+/// prompt = "Summarize unread or notable emails."
+/// ```
+///
+/// Opt-in: with no `context_sources` configured this struct's defaults turn
+/// continuous compaction off entirely (`continuous_interval = 0`), so existing
+/// deployments see no behavior change.
+///
+/// Note: the field name `gap_secs` is local to `[compaction]` — it is
+/// intentionally separate from `[sessions].gap_secs`, which gates the dream
+/// lifecycle loop. The two knobs measure the same wall-clock dimension but
+/// drive independent subsystems with different defaults and semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionTomlConfig {
+    /// Trigger continuous compaction every N user exchanges. 0 = disabled.
+    pub continuous_interval: usize,
+    /// Number of recent messages kept verbatim after compaction.
+    pub keep_recent: usize,
+    /// Wall-clock gap (seconds) between user messages that triggers an
+    /// immediate compaction + context refresh _before_ dispatching the new
+    /// message. 0 = disabled. Default: 900 (15 minutes).
+    pub gap_secs: u64,
+    /// Maximum lookback (seconds) for context source queries — caps the time
+    /// window so a multi-day absence does not request multi-day summaries.
+    /// Default: 86_400 (24 hours).
+    pub gap_max_lookback_secs: u64,
+    /// Token cap on the combined hand-summary payload injected into the
+    /// session. Sources that exceed this are truncated with a clear
+    /// `…[truncated]` marker so operators see the cap in logs and prompts.
+    /// Default: 2000.
+    pub context_token_cap: usize,
+    /// Hands to query for contextual summaries after compaction.
+    ///
+    /// Empty by default — the new continuous behaviour kicks in only when at
+    /// least one context source is configured. With no sources the existing
+    /// message-count compaction still runs unchanged.
+    pub context_sources: Vec<CompactionContextSource>,
+}
+
+impl Default for CompactionTomlConfig {
+    fn default() -> Self {
+        Self {
+            continuous_interval: 0,
+            keep_recent: 6,
+            gap_secs: 900,                 // 15 minutes
+            gap_max_lookback_secs: 86_400, // 24 hours
+            context_token_cap: 2000,
+            context_sources: Vec::new(),
         }
     }
 }
@@ -1581,6 +1670,7 @@ impl Default for KernelConfig {
             heartbeat: HeartbeatSettings::default(),
             skills: HashMap::new(),
             sessions: SessionsConfig::default(),
+            compaction: CompactionTomlConfig::default(),
         }
     }
 }

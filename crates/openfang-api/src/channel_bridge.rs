@@ -912,6 +912,23 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         .map(|_| ())
     }
 
+    async fn check_session_gap(&self, agent_id: AgentId) {
+        // Resolve the session's user_id so the per-(agent, user) tracker
+        // works. Falling back to the default user matches everywhere else
+        // in the kernel that reads a session without a logged-in caller.
+        let user_id = self
+            .kernel
+            .registry
+            .get(agent_id)
+            .and_then(|e| self.kernel.memory.get_session(e.session_id).ok().flatten())
+            .map(|s| s.user_id)
+            .unwrap_or_else(openfang_memory::session::default_user_id);
+
+        self.kernel
+            .detect_and_run_session_gap(agent_id, user_id)
+            .await;
+    }
+
     async fn check_auto_reply(&self, agent_id: AgentId, message: &str) -> Option<String> {
         // Check if auto-reply should fire for this message
         let channel_type = "bridge"; // Generic; the bridge layer handles specifics

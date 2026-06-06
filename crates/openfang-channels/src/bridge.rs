@@ -266,6 +266,20 @@ pub trait ChannelBridgeHandle: Send + Sync {
         None
     }
 
+    /// Pre-dispatch session-gap probe.
+    ///
+    /// Called once for every inbound channel message before the agent loop
+    /// runs. Implementations may use this to:
+    /// - update an internal last-message timestamp,
+    /// - and, if the gap exceeds `[compaction] gap_secs`, kick off
+    ///   compaction + context-source queries so a `[Context refresh — ts]`
+    ///   message is injected into the session prior to the user's new turn.
+    ///
+    /// The default impl is a no-op (no side effects, no gap detection).
+    async fn check_session_gap(&self, _agent_id: AgentId) {
+        // Default: nothing happens.
+    }
+
     // ── Automation: workflows, triggers, schedules, approvals ──
 
     /// List all registered workflows as formatted text.
@@ -1329,6 +1343,17 @@ async fn dispatch_message(
     } else {
         text.clone()
     };
+
+    // Session-gap probe. If the configured `[compaction] gap_secs` has
+    // elapsed since the last user message, the kernel runs a compaction +
+    // context refresh and injects a `[Context refresh — ts]` message into
+    // the session so the agent sees it on the very next turn.
+    //
+    // Pre-dispatch on purpose: doing this before `send_message` ensures the
+    // injected message is part of the session the LLM reads when it answers
+    // the user's new turn. A post-dispatch refresh would only affect the
+    // turn after.
+    handle.check_session_gap(agent_id).await;
 
     // Send to agent and relay response
     let result = handle.send_message(agent_id, &prefixed_text).await;
