@@ -929,6 +929,15 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .await;
     }
 
+    fn channel_compaction_enabled(&self) -> bool {
+        // Mirrors the opt-in invariant in docs/CONTINUOUS_COMPACTION.md: with
+        // no `[compaction]` knobs set and no context_sources, the feature is
+        // completely off and channel dispatch must not pay for the
+        // per-message gap probe (lock acquisition + session read).
+        let c = &self.kernel.config.compaction;
+        c.continuous_interval > 0 || c.gap_secs > 0 || !c.context_sources.is_empty()
+    }
+
     async fn check_auto_reply(&self, agent_id: AgentId, message: &str) -> Option<String> {
         // Check if auto-reply should fire for this message
         let channel_type = "bridge"; // Generic; the bridge layer handles specifics

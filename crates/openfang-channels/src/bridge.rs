@@ -280,6 +280,20 @@ pub trait ChannelBridgeHandle: Send + Sync {
         // Default: nothing happens.
     }
 
+    /// Reports whether continuous-compaction features are configured at all.
+    ///
+    /// Returns `true` when any of the cadence trigger, gap trigger, or
+    /// context sources are enabled. Callers should use this to skip
+    /// `check_session_gap` entirely on the hot inbound-message path when
+    /// the feature is fully opt-out, avoiding even the cost of a lock
+    /// acquisition and session read.
+    ///
+    /// Default impl returns `false` — test doubles and adapters without a
+    /// kernel report the feature disabled.
+    fn channel_compaction_enabled(&self) -> bool {
+        false
+    }
+
     // ── Automation: workflows, triggers, schedules, approvals ──
 
     /// List all registered workflows as formatted text.
@@ -1353,7 +1367,14 @@ async fn dispatch_message(
     // injected message is part of the session the LLM reads when it answers
     // the user's new turn. A post-dispatch refresh would only affect the
     // turn after.
-    handle.check_session_gap(agent_id).await;
+    //
+    // Gated on `channel_compaction_enabled()` so deployments with no
+    // `[compaction]` block pay nothing — not even the lock acquisition and
+    // session read inside `check_session_gap`. See the opt-in invariant in
+    // docs/CONTINUOUS_COMPACTION.md.
+    if handle.channel_compaction_enabled() {
+        handle.check_session_gap(agent_id).await;
+    }
 
     // Send to agent and relay response
     let result = handle.send_message(agent_id, &prefixed_text).await;

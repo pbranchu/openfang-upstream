@@ -1397,7 +1397,8 @@ pub struct CompactionTomlConfig {
     pub keep_recent: usize,
     /// Wall-clock gap (seconds) between user messages that triggers an
     /// immediate compaction + context refresh _before_ dispatching the new
-    /// message. 0 = disabled. Default: 900 (15 minutes).
+    /// message. 0 disables gap-triggered refresh (default). Set explicitly
+    /// (e.g. 900 = 15 minutes) to enable.
     pub gap_secs: u64,
     /// Maximum lookback (seconds) for context source queries — caps the time
     /// window so a multi-day absence does not request multi-day summaries.
@@ -1421,7 +1422,7 @@ impl Default for CompactionTomlConfig {
         Self {
             continuous_interval: 0,
             keep_recent: 6,
-            gap_secs: 900,                 // 15 minutes
+            gap_secs: 0,                   // disabled — set explicitly to enable
             gap_max_lookback_secs: 86_400, // 24 hours
             context_token_cap: 2000,
             context_sources: Vec::new(),

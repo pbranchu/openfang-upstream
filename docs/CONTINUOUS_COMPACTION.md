@@ -61,9 +61,9 @@ Continuous compaction has two triggers and four moving parts.
 
 ```toml
 [compaction]
-continuous_interval = 5           # 0 disables continuous compaction
+continuous_interval = 5           # 0 disables continuous compaction (default)
 keep_recent = 6                   # messages kept verbatim after compaction
-gap_secs = 900                    # 0 disables gap-triggered refresh
+gap_secs = 900                    # 0 disables gap-triggered refresh (default)
 gap_max_lookback_secs = 86400     # cap on the gap query window (24h)
 context_token_cap = 2000          # max combined hand-summary tokens injected
 
@@ -78,11 +78,15 @@ prompt = "Summarize unread or notable emails."
 
 ### Opt-in by default
 
-`continuous_interval = 0` is the default — with no override, continuous
-compaction is fully off. The standard message-count and token-budget
-compaction paths still run unchanged. The feature kicks in **only** when both
-`continuous_interval > 0` and at least one `[[compaction.context_sources]]`
-block exists.
+Both triggers default to off: `continuous_interval = 0` (cadence) and
+`gap_secs = 0` (gap). With no `[compaction]` block in config, continuous
+compaction is fully disabled — the channel bridge skips the pre-dispatch
+gap probe entirely (no lock acquisition, no session read), and the
+standard message-count and token-budget compaction paths still run
+unchanged. The feature kicks in only when at least one of
+`continuous_interval`, `gap_secs`, or `[[compaction.context_sources]]` is
+set, and the cadence trigger additionally requires at least one context
+source to do useful work.
 
 ### Naming: `[compaction] gap_secs` vs `[sessions] gap_secs`
 
@@ -92,7 +96,7 @@ confuse, but they drive independent subsystems:
 | Knob | Default | Drives |
 |------|---------|--------|
 | `[sessions] gap_secs` | 300s (5 min) | Dream lifecycle loop — when an idle session is consolidated into structured memory. |
-| `[compaction] gap_secs` | 900s (15 min) | Pre-dispatch compaction + context refresh on the next inbound message. |
+| `[compaction] gap_secs` | 0 (disabled) | Pre-dispatch compaction + context refresh on the next inbound message. Set explicitly (e.g. `900` = 15 min) to enable. |
 
 They measure the same wall-clock dimension (inactivity) but trigger different
 work. Keep them separate.
@@ -148,6 +152,36 @@ Token cost of the injected payload itself is capped at `context_token_cap` —
 that's the *amount the LLM sees on every subsequent turn until the next
 compaction*, so keep this tight (2 000 tokens is the default; higher numbers
 buy more context but cost on every turn).
+
+---
+
+## Latency considerations
+
+The gap trigger runs **synchronously before** the user's channel dispatch
+— the injected context must be in the session when the LLM reads it for
+the first response after the gap. Worst-case added latency on the user's
+first message after a long gap:
+
+- Compaction summarisation: 1–3 seconds (1 LLM call).
+- Context source queries: up to 30 seconds (per-source timeout, run in
+  parallel — total ≈ slowest source, not sum).
+- Token-cap truncation + session injection: negligible.
+
+The cadence trigger fires asynchronously via `tokio::spawn` and never
+blocks user dispatch. Only the gap trigger sits in front of `send_message`,
+because the whole point of the gap refresh is to have the injected context
+visible to the LLM on the very next turn.
+
+**Operators should configure conservatively:**
+
+- Keep `[[compaction.context_sources]]` short (1–3 hands max).
+- Pick fast hands (`calendar-hand`, `mail-hand` are typical — a single API
+  call each).
+- Avoid slow agents in `context_sources` — they will time out and delay
+  the user's first response after the gap.
+- If your channel has a strict response-time SLA, consider disabling the
+  gap trigger (`gap_secs = 0`) and relying only on the cadence trigger
+  (`continuous_interval = N`), which runs asynchronously after each turn.
 
 ---
 
