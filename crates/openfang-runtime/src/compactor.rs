@@ -53,6 +53,9 @@ pub struct CompactionConfig {
     /// Number of tool calls between structured extraction passes.
     /// Used by `needs_extraction` to gate the mini-dream / extractor flow.
     pub tool_calls_between_extractions: usize,
+    /// Trigger continuous compaction every N user exchanges. 0 = disabled.
+    /// Mirrors `[compaction].continuous_interval` from `KernelConfig`.
+    pub continuous_interval: usize,
 }
 
 impl Default for CompactionConfig {
@@ -70,8 +73,29 @@ impl Default for CompactionConfig {
             token_threshold_ratio: 0.7,
             context_window_tokens: 200_000,
             tool_calls_between_extractions: 10,
+            continuous_interval: 0,
         }
     }
+}
+
+/// Check whether continuous compaction should fire on this exchange.
+///
+/// Returns `true` when all of:
+/// - continuous compaction is enabled (`continuous_interval > 0`)
+/// - the session is long enough that compacting it makes sense
+///   (`session_message_count > keep_recent`)
+/// - the exchange counter has reached a multiple of `continuous_interval`
+///
+/// The exchange counter is owned by the kernel (per agent + user); callers
+/// pass the post-increment value.
+pub fn needs_continuous_compaction(
+    exchange_count: usize,
+    session_message_count: usize,
+    config: &CompactionConfig,
+) -> bool {
+    config.continuous_interval > 0
+        && session_message_count > config.keep_recent
+        && exchange_count.is_multiple_of(config.continuous_interval)
 }
 
 /// Result of a compaction operation.
@@ -624,9 +648,10 @@ async fn summarize_messages(
         conversation_text = conversation_text[safe_start..].to_string();
     }
 
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
     let summarize_prompt = format!(
-        "Summarize the following conversation preserving key facts, decisions, user preferences, \
-         and important context. Be concise but thorough. Output only the summary, no preamble.\n\n\
+        "Current time: {now}\n\n\
+         Summarize the following conversation. Output only the summary, no preamble.\n\n\
          ---\n{conversation_text}---"
     );
 
@@ -644,8 +669,13 @@ async fn summarize_messages(
         max_tokens: config.max_summary_tokens,
         temperature: 0.3,
         system: Some(
-            "You are a conversation summarizer. Produce a concise summary that captures \
-             all key facts, decisions, and context from the conversation."
+            "You are a conversation summarizer. Produce a concise summary that:\n\
+             - Preserves key facts, decisions, user preferences, and ongoing tasks\n\
+             - Drops facts and events that are no longer relevant to current context\n\
+             - For calendar data: keep only events from the last 6h and next 24h\n\
+             - For email data: keep only notable unread emails, drop ads and promotions\n\
+             - Uses absolute dates/times (YYYY-MM-DD HH:MM), never relative\n\
+             - Is concise — only what's still relevant matters"
                 .to_string(),
         ),
         thinking: None,
@@ -993,6 +1023,62 @@ mod tests {
         assert_eq!(config.max_summary_tokens, 1024);
         assert!((config.token_threshold_ratio - 0.7).abs() < f64::EPSILON);
         assert_eq!(config.context_window_tokens, 200_000);
+        assert_eq!(
+            config.continuous_interval, 0,
+            "continuous compaction must be opt-in by default"
+        );
+    }
+
+    // ── needs_continuous_compaction ─────────────────────────────────────────
+    //
+    // The trigger predicate balances three gates:
+    //   1. continuous_interval > 0 (feature enabled)
+    //   2. session is long enough that compaction is worthwhile
+    //   3. exchange count has hit a multiple of the interval
+    //
+    // All three must hold; missing any one returns false.
+
+    #[test]
+    fn test_continuous_compaction_disabled_when_interval_zero() {
+        let config = CompactionConfig {
+            continuous_interval: 0,
+            keep_recent: 6,
+            ..Default::default()
+        };
+        // Even with a long session and any exchange count, interval=0 disables.
+        assert!(!needs_continuous_compaction(5, 100, &config));
+        assert!(!needs_continuous_compaction(50, 100, &config));
+    }
+
+    #[test]
+    fn test_continuous_compaction_fires_on_interval_multiple() {
+        let config = CompactionConfig {
+            continuous_interval: 5,
+            keep_recent: 6,
+            ..Default::default()
+        };
+        // session must exceed keep_recent
+        assert!(needs_continuous_compaction(5, 10, &config));
+        assert!(needs_continuous_compaction(10, 10, &config));
+        assert!(needs_continuous_compaction(15, 10, &config));
+        // not a multiple of 5 → false
+        assert!(!needs_continuous_compaction(4, 10, &config));
+        assert!(!needs_continuous_compaction(6, 10, &config));
+        assert!(!needs_continuous_compaction(9, 10, &config));
+    }
+
+    #[test]
+    fn test_continuous_compaction_skips_short_sessions() {
+        let config = CompactionConfig {
+            continuous_interval: 5,
+            keep_recent: 6,
+            ..Default::default()
+        };
+        // exchange_count=5 is a multiple, but session has only keep_recent (6)
+        // messages — nothing meaningful to compact. Boundary: == keep_recent.
+        assert!(!needs_continuous_compaction(5, 6, &config));
+        // Strictly greater than keep_recent → fires.
+        assert!(needs_continuous_compaction(5, 7, &config));
     }
 
     #[tokio::test]
