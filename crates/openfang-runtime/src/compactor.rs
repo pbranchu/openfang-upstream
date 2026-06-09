@@ -228,7 +228,16 @@ pub async fn extract_structured(
          - open_items: Unresolved questions or pending actions"
     );
 
-    let request = CompletionRequest {
+    // Structured extraction emits a JSON object whose size scales with the
+    // conversation. The prose-summary budget (`max_summary_tokens`, default
+    // 1024) truncates it mid-JSON, which fails `serde_json` parsing and — since
+    // every retry re-sent the identical request — silently disabled compaction
+    // (the "EOF while parsing a string" failures, leading to history bloat).
+    // Budget it generously and grow it on each retry so a one-off large session
+    // recovers instead of failing deterministically.
+    const EXTRACTION_MIN_TOKENS: u32 = 4096;
+    const EXTRACTION_MAX_TOKENS: u32 = 16384;
+    let mut request = CompletionRequest {
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
@@ -240,7 +249,7 @@ pub async fn extract_structured(
             ..Default::default()
         }],
         tools: vec![],
-        max_tokens: config.max_summary_tokens,
+        max_tokens: config.max_summary_tokens.max(EXTRACTION_MIN_TOKENS),
         temperature: 0.3,
         system: Some(
             "You are a memory extraction assistant. Extract structured information from conversations \
@@ -274,6 +283,13 @@ pub async fn extract_structured(
                     }
                     Err(e) => {
                         warn!(attempt, error = %e, "Failed to parse structured extraction JSON, retrying");
+                        // The dominant failure is a truncated JSON (response hit
+                        // max_tokens). Grow the budget so the retry isn't a
+                        // deterministic repeat of the same truncation.
+                        request.max_tokens = request
+                            .max_tokens
+                            .saturating_mul(2)
+                            .min(EXTRACTION_MAX_TOKENS);
                     }
                 }
             }
